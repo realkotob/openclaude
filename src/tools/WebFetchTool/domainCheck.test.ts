@@ -4,6 +4,7 @@ import axios from 'axios'
 const originalEnv = { ...process.env }
 
 async function importFreshModule() {
+  mock.restore()
   return import(`./utils.ts?ts=${Date.now()}-${Math.random()}`)
 }
 
@@ -13,11 +14,18 @@ beforeEach(() => {
 
 afterEach(() => {
   process.env = { ...originalEnv }
+  mock.restore()
 })
 
 describe('checkDomainBlocklist', () => {
   test('returns allowed without API call in OpenAI mode', async () => {
     process.env.CLAUDE_CODE_USE_OPENAI = '1'
+    const actual = await import('../../utils/model/providers.js')
+    mock.module('../../utils/model/providers.js', () => ({
+      ...actual,
+      getAPIProvider: () => 'openai',
+      isFirstPartyAnthropicBaseUrl: () => false,
+    }))
     const getSpy = mock(() =>
       Promise.resolve({ status: 200, data: { can_fetch: true } }),
     )
@@ -32,6 +40,12 @@ describe('checkDomainBlocklist', () => {
 
   test('returns allowed without API call in Gemini mode', async () => {
     process.env.CLAUDE_CODE_USE_GEMINI = '1'
+    const actual = await import('../../utils/model/providers.js')
+    mock.module('../../utils/model/providers.js', () => ({
+      ...actual,
+      getAPIProvider: () => 'gemini',
+      isFirstPartyAnthropicBaseUrl: () => false,
+    }))
     const getSpy = mock(() =>
       Promise.resolve({ status: 200, data: { can_fetch: true } }),
     )
@@ -49,6 +63,12 @@ describe('checkDomainBlocklist', () => {
     delete process.env.CLAUDE_CODE_USE_GEMINI
     delete process.env.CLAUDE_CODE_USE_GITHUB
 
+    const actual = await import('../../utils/model/providers.js')
+    mock.module('../../utils/model/providers.js', () => ({
+      ...actual,
+      getAPIProvider: () => 'firstParty',
+      isFirstPartyAnthropicBaseUrl: () => true,
+    }))
     const getSpy = mock(() =>
       Promise.resolve({ status: 200, data: { can_fetch: true } }),
     )
