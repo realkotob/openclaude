@@ -3,24 +3,38 @@
  * githubModelsCredentials so Bun's mock.module can replace secureStorage
  * before that module is first loaded.
  */
-import { afterEach, describe, expect, mock, test } from 'bun:test'
+import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test'
+import {
+  acquireSharedMutationLock,
+  releaseSharedMutationLock,
+} from '../test/sharedMutationLock.js'
 
 describe('hydrateGithubModelsTokenFromSecureStorage', () => {
   const orig = {
     CLAUDE_CODE_USE_GITHUB: process.env.CLAUDE_CODE_USE_GITHUB,
     GITHUB_TOKEN: process.env.GITHUB_TOKEN,
     GH_TOKEN: process.env.GH_TOKEN,
+    CLAUDE_CODE_GITHUB_TOKEN_HYDRATED:
+      process.env.CLAUDE_CODE_GITHUB_TOKEN_HYDRATED,
     CLAUDE_CODE_SIMPLE: process.env.CLAUDE_CODE_SIMPLE,
   }
 
+  beforeEach(async () => {
+    await acquireSharedMutationLock('utils/githubModelsCredentials.hydrate.test.ts')
+  })
+
   afterEach(() => {
-    mock.restore()
-    for (const [k, v] of Object.entries(orig)) {
-      if (v === undefined) {
-        delete process.env[k as keyof typeof orig]
-      } else {
-        process.env[k as keyof typeof orig] = v
+    try {
+      mock.restore()
+      for (const [k, v] of Object.entries(orig)) {
+        if (v === undefined) {
+          delete process.env[k as keyof typeof orig]
+        } else {
+          process.env[k as keyof typeof orig] = v
+        }
       }
+    } finally {
+      releaseSharedMutationLock()
     }
   })
 
@@ -39,15 +53,17 @@ describe('hydrateGithubModelsTokenFromSecureStorage', () => {
     }))
 
     const { hydrateGithubModelsTokenFromSecureStorage } = await import(
-      './githubModelsCredentials.js'
+      './githubModelsCredentials.js?hydrate=sets-token'
     )
     hydrateGithubModelsTokenFromSecureStorage()
     expect(process.env.GITHUB_TOKEN).toBe('stored-secret')
+    expect(process.env.CLAUDE_CODE_GITHUB_TOKEN_HYDRATED).toBe('1')
   })
 
   test('does not override existing GITHUB_TOKEN', async () => {
     process.env.CLAUDE_CODE_USE_GITHUB = '1'
     process.env.GITHUB_TOKEN = 'already'
+    delete process.env.CLAUDE_CODE_GITHUB_TOKEN_HYDRATED
 
     mock.module('./secureStorage/index.js', () => ({
       getSecureStorage: () => ({
@@ -58,9 +74,10 @@ describe('hydrateGithubModelsTokenFromSecureStorage', () => {
     }))
 
     const { hydrateGithubModelsTokenFromSecureStorage } = await import(
-      './githubModelsCredentials.js'
+      './githubModelsCredentials.js?hydrate=preserve-existing'
     )
     hydrateGithubModelsTokenFromSecureStorage()
     expect(process.env.GITHUB_TOKEN).toBe('already')
+    expect(process.env.CLAUDE_CODE_GITHUB_TOKEN_HYDRATED).toBeUndefined()
   })
 })

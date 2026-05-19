@@ -20,7 +20,6 @@ import {
 } from 'src/services/analytics/metadata.js'
 import {
   addToToolDuration,
-  getCodeEditToolDecisionCounter,
   getStatsStore,
 } from '../../bootstrap/state.js'
 import {
@@ -38,11 +37,13 @@ import {
 import type { BashToolInput } from '../../tools/BashTool/BashTool.js'
 import { startSpeculativeClassifierCheck } from '../../tools/BashTool/bashPermissions.js'
 import { BASH_TOOL_NAME } from '../../tools/BashTool/toolName.js'
+import { ASK_USER_QUESTION_TOOL_NAME } from '../../tools/AskUserQuestionTool/prompt.js'
 import { FILE_EDIT_TOOL_NAME } from '../../tools/FileEditTool/constants.js'
 import { FILE_READ_TOOL_NAME } from '../../tools/FileReadTool/prompt.js'
 import { FILE_WRITE_TOOL_NAME } from '../../tools/FileWriteTool/prompt.js'
 import { NOTEBOOK_EDIT_TOOL_NAME } from '../../tools/NotebookEditTool/constants.js'
 import { POWERSHELL_TOOL_NAME } from '../../tools/PowerShellTool/toolName.js'
+import { SKILL_TOOL_NAME } from '../../tools/SkillTool/constants.js'
 import { parseGitCommitId } from '../../tools/shared/gitOperationTracking.js'
 import {
   isDeferredTool,
@@ -87,17 +88,6 @@ import {
 } from '../../utils/sessionActivity.js'
 import { jsonStringify } from '../../utils/slowOperations.js'
 import { Stream } from '../../utils/stream.js'
-import { logOTelEvent } from '../../utils/telemetry/events.js'
-import {
-  addToolContentEvent,
-  endToolBlockedOnUserSpan,
-  endToolExecutionSpan,
-  endToolSpan,
-  isBetaTracingEnabled,
-  startToolBlockedOnUserSpan,
-  startToolExecutionSpan,
-  startToolSpan,
-} from '../../utils/telemetry/sessionTracing.js'
 import {
   formatError,
   formatZodValidationError,
@@ -596,10 +586,73 @@ export function buildSchemaNotSentHint(
   )
 }
 
+export function getSchemaValidationErrorOverride(
+  tool: Tool,
+  input: unknown,
+): string | null {
+  if (tool.name !== SKILL_TOOL_NAME || !input || typeof input !== 'object') {
+    return null
+  }
+
+  const skill = (input as { skill?: unknown }).skill
+  if (skill === undefined || skill === null) {
+    return 'Missing skill name. Pass the slash command name as the skill parameter (e.g., skill: "commit" for /commit, skill: "review-pr" for /review-pr).'
+  }
+
+  return null
+}
+
+export function getSchemaValidationToolUseResult(
+  tool: Tool,
+  input: unknown,
+  fallbackMessage?: string,
+): string {
+  const override = getSchemaValidationErrorOverride(tool, input)
+  return `InputValidationError: ${override ?? fallbackMessage ?? ''}`
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+export function normalizeToolInputForValidation(
+  tool: Pick<Tool, 'name'>,
+  input: unknown,
+): unknown {
+  if (tool.name !== ASK_USER_QUESTION_TOOL_NAME || !isRecord(input)) {
+    return input
+  }
+
+  if (Array.isArray(input.questions)) {
+    return input
+  }
+
+  const { question, header, options, multiSelect, ...rest } = input
+  if (
+    typeof question !== 'string' ||
+    typeof header !== 'string' ||
+    !Array.isArray(options)
+  ) {
+    return input
+  }
+
+  return {
+    ...rest,
+    questions: [
+      {
+        question,
+        header,
+        options,
+        ...(typeof multiSelect === 'boolean' ? { multiSelect } : {}),
+      },
+    ],
+  }
+}
+
 async function checkPermissionsAndCallTool(
   tool: Tool,
   toolUseID: string,
-  input: { [key: string]: boolean | string | number },
+  input: unknown,
   toolUseContext: ToolUseContext,
   canUseTool: CanUseToolFn,
   assistantMessage: AssistantMessage,
@@ -611,10 +664,13 @@ async function checkPermissionsAndCallTool(
     progress: ToolProgress<ToolProgressData> | ProgressMessage<HookProgress>,
   ) => void,
 ): Promise<MessageUpdateLazy[]> {
+  const normalizedInput = normalizeToolInputForValidation(tool, input)
   // Validate input types with zod (surprisingly, the model is not great at generating valid input)
-  const parsedInput = tool.inputSchema.safeParse(input)
+  const parsedInput = tool.inputSchema.safeParse(normalizedInput)
   if (!parsedInput.success) {
-    let errorContent = formatZodValidationError(tool.name, parsedInput.error)
+    const fallbackErrorContent = formatZodValidationError(tool.name, parsedInput.error)
+    let errorContent =
+      getSchemaValidationErrorOverride(tool, normalizedInput) ?? fallbackErrorContent
 
     const schemaHint = buildSchemaNotSentHint(
       tool,
@@ -672,7 +728,11 @@ async function checkPermissionsAndCallTool(
               tool_use_id: toolUseID,
             },
           ],
-          toolUseResult: `InputValidationError: ${parsedInput.error.message}`,
+          toolUseResult: getSchemaValidationToolUseResult(
+            tool,
+            normalizedInput,
+            parsedInput.error.message,
+          ),
           sourceToolAssistantUUID: assistantMessage.uuid,
         }),
       },
@@ -906,13 +966,6 @@ async function checkPermissionsAndCallTool(
     }
   }
 
-  startToolSpan(
-    tool.name,
-    toolAttributes,
-    isBetaTracingEnabled() ? jsonStringify(processedInput) : undefined,
-  )
-  startToolBlockedOnUserSpan()
-
   // Check whether we have permission to use the tool,
   // and ask the user for permission if we don't
   const permissionMode = toolUseContext.getAppState().toolPermissionContext.mode
@@ -959,21 +1012,6 @@ async function checkPermissionsAndCallTool(
       permissionDecision.decisionReason,
       permissionDecision.behavior,
     )
-    void logOTelEvent('tool_decision', {
-      decision,
-      source,
-      tool_name: sanitizeToolNameForAnalytics(tool.name),
-    })
-
-    // Increment code-edit tool decision counter for headless mode
-    if (isCodeEditingTool(tool.name)) {
-      void buildCodeEditToolAttributes(
-        tool,
-        processedInput,
-        decision,
-        source,
-      ).then(attributes => getCodeEditToolDecisionCounter()?.add(1, attributes))
-    }
   }
 
   // Add message if permission was granted/denied by PermissionRequest hook
@@ -995,8 +1033,6 @@ async function checkPermissionsAndCallTool(
   if (permissionDecision.behavior !== 'allow') {
     logForDebugging(`${tool.name} tool permission denied`)
     const decisionInfo = toolUseContext.toolDecisions?.get(toolUseID)
-    endToolBlockedOnUserSpan('reject', decisionInfo?.source || 'unknown')
-    endToolSpan()
 
     logEvent('tengu_tool_use_can_use_tool_rejected', {
       messageID:
@@ -1169,11 +1205,6 @@ async function checkPermissionsAndCallTool(
   }
 
   const decisionInfo = toolUseContext.toolDecisions?.get(toolUseID)
-  endToolBlockedOnUserSpan(
-    decisionInfo?.decision || 'unknown',
-    decisionInfo?.source || 'unknown',
-  )
-  startToolExecutionSpan()
 
   const startTime = Date.now()
 
@@ -1209,6 +1240,7 @@ async function checkPermissionsAndCallTool(
       {
         ...toolUseContext,
         toolUseId: toolUseID,
+        hookChainsCanUseTool: canUseTool,
         userModified: permissionDecision.userModified ?? false,
       },
       canUseTool,
@@ -1223,51 +1255,6 @@ async function checkPermissionsAndCallTool(
     const durationMs = Date.now() - startTime
     addToToolDuration(durationMs)
 
-    // Log tool content/output as span event if enabled
-    if (result.data && typeof result.data === 'object') {
-      const contentAttributes: Record<string, string | number | boolean> = {}
-
-      // Read tool: capture file_path and content
-      if (tool.name === FILE_READ_TOOL_NAME && 'content' in result.data) {
-        if ('file_path' in processedInput) {
-          contentAttributes.file_path = String(processedInput.file_path)
-        }
-        contentAttributes.content = String(result.data.content)
-      }
-
-      // Edit/Write tools: capture file_path and diff
-      if (
-        (tool.name === FILE_EDIT_TOOL_NAME ||
-          tool.name === FILE_WRITE_TOOL_NAME) &&
-        'file_path' in processedInput
-      ) {
-        contentAttributes.file_path = String(processedInput.file_path)
-
-        // For Edit, capture the actual changes made
-        if (tool.name === FILE_EDIT_TOOL_NAME && 'diff' in result.data) {
-          contentAttributes.diff = String(result.data.diff)
-        }
-        // For Write, capture the written content
-        if (tool.name === FILE_WRITE_TOOL_NAME && 'content' in processedInput) {
-          contentAttributes.content = String(processedInput.content)
-        }
-      }
-
-      // Bash tool: capture command
-      if (tool.name === BASH_TOOL_NAME && 'command' in processedInput) {
-        const bashInput = processedInput as BashToolInput
-        contentAttributes.bash_command = bashInput.command
-        // Also capture output if available
-        if ('output' in result.data) {
-          contentAttributes.output = String(result.data.output)
-        }
-      }
-
-      if (Object.keys(contentAttributes).length > 0) {
-        addToolContentEvent('tool.output', contentAttributes)
-      }
-    }
-
     // Capture structured output from tool result if present
     if (typeof result === 'object' && 'structured_output' in result) {
       // Store the structured output in an attachment message
@@ -1278,14 +1265,6 @@ async function checkPermissionsAndCallTool(
         }),
       })
     }
-
-    endToolExecutionSpan({ success: true })
-    // Pass tool result for new_context logging
-    const toolResultStr =
-      result.data && typeof result.data === 'object'
-        ? jsonStringify(result.data)
-        : String(result.data ?? '')
-    endToolSpan(toolResultStr)
 
     // Map the tool result to API format once and cache it. This block is reused
     // by addToolResult (skipping the remap) and measured here for analytics.
@@ -1378,22 +1357,7 @@ async function checkPermissionsAndCallTool(
       ? getMcpServerScopeFromToolName(tool.name)
       : null
 
-    void logOTelEvent('tool_result', {
-      tool_name: sanitizeToolNameForAnalytics(tool.name),
-      success: 'true',
-      duration_ms: String(durationMs),
-      ...(Object.keys(toolParameters).length > 0 && {
-        tool_parameters: jsonStringify(toolParameters),
-      }),
-      ...(telemetryToolInput && { tool_input: telemetryToolInput }),
-      tool_result_size_bytes: String(toolResultSizeBytes),
-      ...(decisionInfo && {
-        decision_source: decisionInfo.source,
-        decision_type: decisionInfo.decision,
-      }),
-      ...(mcpServerScope && { mcp_server_scope: mcpServerScope }),
-    })
-
+    
     // Run PostToolUse hooks
     let toolOutput = result.data
     const hookResults = []
@@ -1590,12 +1554,6 @@ async function checkPermissionsAndCallTool(
     const durationMs = Date.now() - startTime
     addToToolDuration(durationMs)
 
-    endToolExecutionSpan({
-      success: false,
-      error: errorMessage(error),
-    })
-    endToolSpan()
-
     // Handle MCP auth errors by updating the client status to 'needs-auth'
     // This updates the /mcp display to show the server needs re-authorization
     if (error instanceof McpAuthError) {
@@ -1671,23 +1629,7 @@ async function checkPermissionsAndCallTool(
         ? getMcpServerScopeFromToolName(tool.name)
         : null
 
-      void logOTelEvent('tool_result', {
-        tool_name: sanitizeToolNameForAnalytics(tool.name),
-        use_id: toolUseID,
-        success: 'false',
-        duration_ms: String(durationMs),
-        error: errorMessage(error),
-        ...(Object.keys(toolParameters).length > 0 && {
-          tool_parameters: jsonStringify(toolParameters),
-        }),
-        ...(telemetryToolInput && { tool_input: telemetryToolInput }),
-        ...(decisionInfo && {
-          decision_source: decisionInfo.source,
-          decision_type: decisionInfo.decision,
-        }),
-        ...(mcpServerScope && { mcp_server_scope: mcpServerScope }),
-      })
-    }
+          }
     const content = formatError(error)
 
     // Determine if this was a user interrupt
@@ -1697,19 +1639,29 @@ async function checkPermissionsAndCallTool(
     const hookMessages: MessageUpdateLazy<
       AttachmentMessage | ProgressMessage<HookProgress>
     >[] = []
-    for await (const hookResult of runPostToolUseFailureHooks(
-      toolUseContext,
-      tool,
-      toolUseID,
-      messageId,
-      processedInput,
-      content,
-      isInterrupt,
-      requestId,
-      mcpServerType,
-      mcpServerBaseUrl,
-    )) {
-      hookMessages.push(hookResult)
+    const hookChainsContext = toolUseContext as ToolUseContext & {
+      hookChainsCanUseTool?: CanUseToolFn
+    }
+    hookChainsContext.hookChainsCanUseTool = canUseTool
+    try {
+      for await (const hookResult of runPostToolUseFailureHooks(
+        toolUseContext,
+        tool,
+        toolUseID,
+        messageId,
+        processedInput,
+        content,
+        isInterrupt,
+        requestId,
+        mcpServerType,
+        mcpServerBaseUrl,
+      )) {
+        hookMessages.push(hookResult)
+      }
+    } finally {
+      if (hookChainsContext.hookChainsCanUseTool === canUseTool) {
+        delete hookChainsContext.hookChainsCanUseTool
+      }
     }
 
     return [

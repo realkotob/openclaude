@@ -1,6 +1,25 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const Module = require('node:module');
+const { mock } = require('bun:test');
+const {
+  acquireEnvMutex,
+  releaseEnvMutex,
+} = require('../../../src/entrypoints/sdk/shared.js');
+
+test.beforeEach(async () => {
+  const result = await acquireEnvMutex();
+  if (!result.acquired) {
+    throw new Error('Timed out acquiring shared test mutation lock for vscode extension test');
+  }
+});
+
+test.afterEach(() => {
+  try {
+    mock.restore();
+  } finally {
+    releaseEnvMutex();
+  }
+});
 
 function createStatus(overrides = {}) {
   return {
@@ -30,27 +49,32 @@ function createStatus(overrides = {}) {
 function loadExtension() {
   const extensionPath = require.resolve('./extension');
   delete require.cache[extensionPath];
-
-  const originalLoad = Module._load;
-  Module._load = function patchedLoad(request, parent, isMain) {
-    if (request === 'vscode') {
-      return {
-        workspace: {},
-        window: {},
-        env: {},
-        commands: {},
-        Uri: { parse: value => value, file: value => value },
-      };
-    }
-
-    return originalLoad.call(this, request, parent, isMain);
-  };
-
-  try {
-    return require('./extension');
-  } finally {
-    Module._load = originalLoad;
-  }
+  mock.module('vscode', () => ({
+    workspace: {
+      workspaceFolders: [],
+      getConfiguration: () => ({
+        get: (_key, fallback) => fallback,
+      }),
+      getWorkspaceFolder: () => null,
+    },
+    window: {
+      activeTextEditor: null,
+      createWebviewPanel: () => ({}),
+      registerWebviewViewProvider: () => ({ dispose() {} }),
+      showInformationMessage: async () => undefined,
+      showErrorMessage: async () => undefined,
+    },
+    env: {
+      openExternal: async () => true,
+    },
+    commands: {
+      registerCommand: () => ({ dispose() {} }),
+      executeCommand: async () => undefined,
+    },
+    Uri: { parse: value => value, file: value => value },
+    ViewColumn: { Active: 1 },
+  }));
+  return require('./extension');
 }
 
 test('renderControlCenterHtml uses the OpenClaude wordmark, status rail, and warm action hierarchy', () => {
